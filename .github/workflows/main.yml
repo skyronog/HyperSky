@@ -1,0 +1,89 @@
+name: Build Release APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      # Both are optional. If the secrets don't exist these are just empty and the app falls back
+      # (CurseForge searches use a community mirror, Gemini AI analysis stays disabled).
+      CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+      HYPER_LAUNCHER_API_KEY: ${{ secrets.HYPER_LAUNCHER_API_KEY }}
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # The runner already ships the Android SDK, so we only accept licenses and add NDK + CMake.
+      # (android-actions/setup-android is removed: it fails with "Failed to find package 'tools'".)
+      - name: Install NDK and CMake
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "ndk;29.0.14206865" "cmake;3.22.1"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Build release APKs (full runtime)
+        run: |
+          chmod +x gradlew
+          ./gradlew :Hyper_Launcher_v3:assembleFullRelease --stacktrace
+
+      - name: Sign APKs
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Signing with your own keystore"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            KS="$RUNNER_TEMP/release.jks"
+            KS_PASS="$KEYSTORE_PASSWORD"
+            ALIAS="$KEY_ALIAS"
+            K_PASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          else
+            echo "No keystore secrets found: falling back to the repo debug keystore"
+            KS="Hyper_Launcher_v3/debug.keystore"
+            KS_PASS="android"
+            ALIAS="androiddebugkey"
+            K_PASS="android"
+          fi
+
+          for apk in Hyper_Launcher_v3/build/outputs/apk/full/release/*.apk; do
+            echo "Signing $apk"
+            "$BT/apksigner" sign \
+              --ks "$KS" \
+              --ks-pass "pass:$KS_PASS" \
+              --key-pass "pass:$K_PASS" \
+              --ks-key-alias "$ALIAS" \
+              "$apk"
+          done
+          ls -lh Hyper_Launcher_v3/build/outputs/apk/full/release/
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: hyper-launcher-release
+          path: Hyper_Launcher_v3/build/outputs/apk/full/release/*.apk
+          if-no-files-found: error
